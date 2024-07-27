@@ -41,8 +41,8 @@ export class VoteMessage extends Message {
 }
 
 
-export class EnterMessage extends Message {
-    type = "enter";
+export class TimeoutMessage extends Message {
+    type = "timeout";
     level: number;
     cc: CommitCertificate;
     

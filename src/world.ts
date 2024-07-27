@@ -14,13 +14,17 @@ export class Signal {
     to: Peer;
     message: Message;
 
-    timeToArrival: number;
+    timeToArrival!: number;
 
     constructor(from: Peer, to: Peer, message: Message) {
         this.from = from;
         this.to = to;
         this.message = message;
-        this.timeToArrival = Math.min(orchestrator.DELTA * 10, Math.max(1, samplePoisson(orchestrator.DELTA)));
+    }
+    
+    setArrivalTime(meanDuration: number) {
+        // Max * 20 is effectively a timeout
+        this.timeToArrival = Math.min(meanDuration * 20, Math.max(1, samplePoisson(meanDuration)));
     }
 }
 
@@ -68,18 +72,27 @@ export class RoundRobinProposerSelectorLogic extends ProposerSelectorLogic {
 }
 
 
-export const orchestrator = new class Orchestrator {
+export class Orchestrator {
     signals: Signal[] = [];
 
     // Expected time for a signal to communicate
-    DELTA = 5;
-    DROP_RATE = 0.1;
+    DELTA: number;
+    DROP_RATE: number;
+    // Maximum number of signal that can make progress on a given tick
+    MAX_BANDWIDTH: number;
 
     time = 0;
 
     liveSignalsStats: Map<number, number> = new Map();
 
+    constructor(delta = 5, maxBandwidth = 20, dropRate = 0.1) {
+        this.DELTA = delta;
+        this.MAX_BANDWIDTH = maxBandwidth;
+        this.DROP_RATE = dropRate;
+    }
+
     addSignal(signal: Signal) {
+        signal.setArrivalTime(this.DELTA);
         this.signals.push(signal);
     }
 
@@ -92,13 +105,21 @@ export const orchestrator = new class Orchestrator {
     processSignals() {
         const processSignals = this.signals;
         this.signals = [];
-        console.log("Processing", processSignals.length, "in-flight signals")
-        processSignals.forEach(signal => {
+        console.debug("Processing", processSignals.length, "in-flight signals")
+        if (this.signals.length > this.MAX_BANDWIDTH) {
+            // randomize the order of processing
+            processSignals.sort(() => Math.random() - 0.5);
+        }
+        processSignals.forEach((signal, i, _) => {
             // Occasionally drop signals
             // Actually not if I'm simulating TCP and the random length is simulating retries.
             //if (Math.random() < this.DROP_RATE) {
             //    return;
             //}
+            if (i > this.MAX_BANDWIDTH) {
+                this.signals.push(signal);
+                return;
+            }
             signal.timeToArrival -= 1;
             if (signal.timeToArrival > 0) {
                 this.signals.push(signal);
@@ -109,20 +130,20 @@ export const orchestrator = new class Orchestrator {
     }
 }
 
+export const orchestrator = new Orchestrator();
+
 export function kickoff(proposerSelector: ProposerSelectorLogic) {
+    // This exists to avoid having to special-case the genesis block in the implementation for simplicity.
     const genesisProposer = proposerSelector.getProposer(0);
     const genesisBlock = new Block("A", null);
     genesisBlock.digest = "A";
 
     proposerSelector.getAllPeers(0).forEach(peer => {
-        peer.replica.level = 0;
-        peer.replica.knownState.set(0, genesisBlock);
+        peer.replica.proposalsVoted.set(0, new ProposeMessage(genesisProposer, genesisBlock, 0));
     });
     
     const starter = proposerSelector.getProposer(1);
+    starter.replica.votesReceived.set(0, new Set(proposerSelector.getAllPeers(0)));
 
-    const cc = new FakeCommitCertificate(0, genesisBlock, new Set(proposerSelector.getAllPeers(0)));
-    starter.replica.updateHighestCCProposal(cc);
-    starter.replica.level = 1;
-    starter.replica.propose("B");
+    starter.replica.proposeNewBlock(1, "B");
 }

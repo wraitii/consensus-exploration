@@ -1,6 +1,5 @@
 {
   "name": "consensus-exploration",
-  "module": "index.ts",
   "type": "module",
   "devDependencies": {
     "@types/bun": "latest"

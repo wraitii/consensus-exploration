@@ -1,29 +1,30 @@
 import {
     ProposerSelectorLogic,
     DummyProposerSelectorLogic,
-    orchestrator,
     Signal
 } from "./world"
 
 import {
     ProposeMessage,
     VoteMessage,
-    EnterMessage,
+    TimeoutMessage,
 } from "./messages";
 
 import { Data, Block } from "./data";
-import { checkCCMatches, FakeCommitCertificate } from "./commitCertif";
-import type { CommitCertificate } from "./commitCertif";
+import { FakeCommitCertificate } from "./commitCertif";
+import type { Orchestrator } from "./world";
 
 export class Peer {
     name: string;
     knownPeers: Peer[];
+    orchestrator: Orchestrator;
 
     replica = new Replica(this);
 
-    constructor(name: string) {
+    constructor(name: string, orchestrator: Orchestrator) {
         this.name = name;
         this.knownPeers = [this];
+        this.orchestrator = orchestrator;
     }
 
     addPeer(peer: Peer) {
@@ -41,304 +42,221 @@ export class Peer {
 
 class Replica {
     peer: Peer;
+    proposerSelectorLogic: ProposerSelectorLogic;
 
-    // This is the view we're in. View "level - 1" is committed.
-    level = 0;
-    knownState = new Map<number, Block>();
-    highestRoundVoted: number | null = null;
-    highestSeenCC: CommitCertificate | null = null;
+    byzantine = false;
 
-    // used by the leader to try and create a CC
-    ccAggregator = new Set<Peer>();
+    // Configurability
+    timeoutDelay = 100; // number of 'ticks' to wait to enter timeout.
+    broadcastTimeout = true; // whether to broadcast timeout messages or just send them to the expected next leader.
 
+    // Actually part of the BFT logic below
+    lastVoteTime = 0;
+    lastVoteLevel = 0;
 
-    proposerSelectorLogic: ProposerSelectorLogic = new DummyProposerSelectorLogic();
-    
-    totalPeers = 0;
-    bizantineOnPurpose = false;
+    proposalsVoted = new Map<number, ProposeMessage>();
+    votesReceived = new Map<number, Set<Peer>>();
 
+    // TODO: this could actually be merged with votesReceived I believe.
+    timeoutsReceived = new Map<number, Set<Peer>>();
 
-    preEnterVotesPerLevel = new Map<number, { highestCC: CommitCertificate, signatures: Set<Peer> }>();
-    ENTER_VOTE_EVERY = 100;
-    timeSinceLastRotation = 0;
+    // The committed chain - this can actually have holes, conceptually, for blocks we haven't seen but we know must be there.
+    committedChain = new Map<number, Block>(); // level -> block
 
-    // Technically these are all local, even if they're the same, but we don't care about that.
-    time = 0;
+    // Not BFT logic core below
+    // internal optimisation
+    hasProposedBlock = new Map<number, boolean>();
 
     constructor(peer: Peer) {
         this.peer = peer;
+        this.proposerSelectorLogic = new DummyProposerSelectorLogic();
     }
 
     tick() {
-        this.time++;
-        this.timeSinceLastRotation++;
-        
-        if (this.timeSinceLastRotation > orchestrator.DELTA * 6) {
-            // Timeout - Enter the next level, and signal others for sync.
-            this.timeSinceLastRotation = 0;
-            this.enterLevel(this.level + 1, true);
-            this.signalEnterLevel();
-            this.enterLevel(this.level - 1, true);
-            console.log("Peer ", this.peer.name, "timed out, expects level", this.level + 1)
+        this.lastVoteTime++;
+        // If the time since our last vote has gotten too high, we can assume
+        // that the next leader proposer is byzantine.
+        // This is a "timeout".
+        // The procedure is to broadcast a message to all saying we're timing out.
+        if (this.lastVoteTime >= this.timeoutDelay) {
+            const message = new TimeoutMessage(this.peer, this.lastVoteLevel, undefined);
+            if (this.broadcastTimeout)
+                this.peer.knownPeers.forEach(p => {
+                    const signal = new Signal(this.peer, p, message);
+                    this.peer.orchestrator.addSignal(signal);
+                });
+            else
+                this.peer.orchestrator.addSignal(new Signal(this.peer, this.proposerSelectorLogic.getProposer(this.lastVoteLevel + 2), message));
+            // This counts as a "nil vote" for the proposal at the next level
+            this.lastVoteTime = 0;
+            this.lastVoteLevel = this.lastVoteLevel + 1;
         }
     }
 
-    setTotalPeers(totalPeers: number) {
-        this.totalPeers = totalPeers;
-    }
-
-    // Protocol core
-
-    updateHighestCCProposal(cc: CommitCertificate) {
-        if (this.highestSeenCC === null || cc.getLevel() > this.highestSeenCC.getLevel()) {
-            this.highestSeenCC = cc;
+    processSignal(signal: Signal) {
+        try {
+            if (signal.message instanceof ProposeMessage) {
+                this.propose(signal.message);
+            } else if (signal.message instanceof VoteMessage) {
+                this.vote(signal.message);
+            } else if (signal.message instanceof TimeoutMessage) {
+                this.onTimeout(signal.message);
+            }
+        } catch (e) {
+            console.error("Error processing signal", e.toString());
         }
     }
 
-    enterLevel(level: number, valueOnly = false) {
-        const oldLevel = this.level;
-        this.level = level;
-        if (valueOnly)
+    propose(signal: ProposeMessage) {
+        console.debug(`${this.peer.name} received propose message`);
+
+        if (this.byzantine)
             return;
-        this.ccAggregator = new Set();
-        this.timeSinceLastRotation = 0;
-        if (this.level % this.ENTER_VOTE_EVERY === 0) {
-            this.signalEnterLevel();
-        }
-    }
 
-    signalEnterLevel() {
-        // Technically I guess we could send this to the next proposer maybe ?
-        const message = new EnterMessage(this.peer, this.level, this.highestSeenCC!); // TODO: assume not null by construction?
-        this.peer.knownPeers.forEach(p => {
-            const signal = new Signal(this.peer, p, message);
-            orchestrator.addSignal(signal);
-        });
-    }
+        // Safety checks
+        if (!signal.commitCertificate)
+            return; // TODO: handle genesis block?
 
-    handleProposeMessage(signal: Signal, mess: ProposeMessage) {
-        
-        // If the message doesn't have a CC, we don't care about it
-        if (mess.commitCertificate === null) {
-            return;
-        }
-        
-        console.log(`Peer ${this.peer.name} (${this.level}) received propose message from ${mess.sender.name} at level ${mess.level} with value ${(mess.data as Block).value}`)
+        // validity - sender is the leader at this height
+        if (signal.sender != this.proposerSelectorLogic.getProposer(signal.level))
+            throw new Error("Invalid proposer");
 
-        // Check the message is from the leader we expect
-        // NB: there's a decent chance that this is weird for the far past even for valid blocks?
-        if (!this.proposerSelectorLogic.isProposer(mess.level, mess.sender)) {
-            console.log("Not the proposer");
-            return;
+        // consistency - Actually on the right level
+        if (signal.level != signal.commitCertificate!.getLevel() + 1)
+            throw new Error("Level mismatch");
+
+        // validity - Certificate is valid (enough signatures)
+        if (!signal.commitCertificate!.checkCertificate(this.proposerSelectorLogic.getAllPeers(signal.level - 1).length)) {
+            console.warn(signal.commitCertificate.peers.size)
+            throw new Error(`Invalid commit certificate at level ${signal.level}`);
         }
 
-        if (mess.level !== mess.commitCertificate.getLevel() + 1) {
-            console.log("Level mismatch");
-            return;
-        }
-        // TODO: I'm pretty sure we need to check that the block is actually a child of a block we know?
+        // non equivocation - did we vote for a different proposal at this level already ?
+        if (this.proposalsVoted.has(signal.level)) // this doesn't actually check for "different", it should
+            throw new Error("Already voted for a proposal at this level");
+        // If I have already voted at a higher level proposal, ignore.
+        if (this.lastVoteLevel > signal.level)
+            throw new Error(`Peer ${this.peer.name} already voted at a higher level ${this.lastVoteLevel}`);
 
-        // Check that the CC is well formed.
-        mess.commitCertificate.checkCertificate(this.totalPeers);
-        
-        // At this point this is necessarily part of the valid branch by construction.
-        // Save the block
-        this.knownState.set(mess.level, mess.data as Block);
+        // validity - certificate builds on top of the last committed value (level - 2)
+        // TODO: this is actually kind of annoying to write
 
-        this.updateHighestCCProposal(mess.commitCertificate);
+        /// validity - block is itself valid - this is checkTx in cosmos SDK - we ignore it for this simulation for now.
 
-        // Reset timer and advance maybe?
-        if (mess.commitCertificate.getLevel() >= this.level) {
-            this.enterLevel(mess.commitCertificate.getLevel() + 1);
+        // We are free to vote !
+        this.proposalsVoted.set(signal.level, signal);
+        this.lastVoteTime = 0;
+        this.lastVoteLevel = signal.level;
 
-            // We can commit the former block.
-            // Two cases: either 2f+1 honest nodes will also receive this message, and this gets committed correctly
-            // or not, and then we'll enter timeout.
-            // Worst case, we are the only ones receiving it, we'll have a higher CC than everyone else, and send that to the leader during the timeout recovery phase.
-            // NB: commit actually does nothing here so we do nothing.
-            console.log("Peer ", this.peer.name, "committed level", this.level - 1, "message with value", this.knownState.get(this.level - 1)?.value);
-        }
-
-        // Then check if we should vote for this proposal.
-
-        // Checks:
-        // - message is for the expected level (we might be on the wrong level but that's kronk for you)
-        // NB: we've done that check above.
-
-        // - We've already checked that the CC was correct.
-
-        // - this proposal is not in conflict with the last proposal we voted for
-        // (either a higher level proposition, or the same exact thing)
-        if ((this.highestRoundVoted || 0) >= mess.level) {
-            // Check that this isn't the proposition we voted for
-            if (!this.knownState.get(mess.level)?.isSame(mess.data as Block))
-            {
-                console.log("Already voted for a higher level");
-                return;
+        // We can safely commit the level-2th block now
+        if (signal.level - 2 >= 0) { // small initialization special case cause lazyness
+            const commitBlock = this.proposalsVoted.get(signal.level - 2)?.data; // this is doing double-duty
+            if (commitBlock) {
+                this.committedChain.set(signal.level - 2, commitBlock as Block);
+                console.info("Peer ", this.peer.name, "committed block at level", signal.level - 2, "with value", commitBlock.value);
+            } else {
+                console.error("Peer ", this.peer.name, "could not find block to commit at level", signal.level - 2);
             }
         }
 
-        this.highestRoundVoted = mess.level;
-
-        const vote = new VoteMessage(this.peer, mess);
+        const vote = new VoteMessage(this.peer, signal);
         // V1: send directly to the target peer
         if (true) {
-            const signal = new Signal(this.peer, this.proposerSelectorLogic.getProposer(this.level + 1), vote);
-            orchestrator.addSignal(signal);
-        } else {
-            // vGossip: send to all known peers and hope it'll land on the proposer
-            console.log("Peer ", this.peer.name, "voted for level", mess.level, "message with value", (mess.data as Block).value)
-            this.peer.knownPeers.forEach(p => {
-                const signal = new Signal(this.peer, p, vote);
-                orchestrator.addSignal(signal);
-            });
+            const voteSignal = new Signal(this.peer, this.proposerSelectorLogic.getProposer(signal.level + 1), vote);
+            this.peer.orchestrator.addSignal(voteSignal);
         }
     }
 
-    handleVoteMessage(signal: Signal, mess: VoteMessage) {
-        // Check what level this vote is for
-        const voteLevel = mess.propose.level;
-        if (voteLevel !== this.level) {
-            return;
-        }
+    vote(signal: VoteMessage) {
+        console.debug(`${this.peer.name} received vote message`);
 
-        // Only if we are proposer of the next round (aka committer of the current round) do we act
-        if (!this.proposerSelectorLogic.isProposer(voteLevel + 1, this.peer)) {
+        if (this.byzantine)
             return;
-        }
-        
-        this.ccAggregator.add(signal.from);
-        this.ccAggregator.add(this.peer); // always add ourselves as a simple optimisation
 
-        console.log(`Peer ${this.peer.name} (${this.level}) received vote message from ${mess.sender.name} at level ${mess.propose.level} with value ${mess.propose.data.value}`)
-        console.log("Peer ", this.peer.name, ", at level", this.level, "has", this.ccAggregator.size, "votes")
-
-        // If we don't know the block, we haven't received it yet - QUERY IT
-        // (for the purposes here, we assume we'll eventually get it)
-        if (this.knownState.get(voteLevel) === undefined) {
-            console.log(`Peer ${this.peer.name} (${this.level}) doesn't know the block for level ${voteLevel}, querying`)
+        // We technically ought store all these, but I think we can mostly ignore that.
+        if (!this.proposerSelectorLogic.isProposer(signal.propose.level + 1, this.peer))
             return;
-        }
-        // If we have a BFT majority, propose the next value
-        if (this.ccAggregator.size >= Math.floor(2 * this.totalPeers / 3) + 1) {
-            try {
-            const lastData = this.knownState.get(this.level)!;
-            this.enterLevel(this.level + 1);
-            // Propose the next letter
-            this.propose(String.fromCharCode(lastData.value.charCodeAt(0) + 1));
-            } catch (e) {
-                console.log("Error", e);
-                console.log("State", this.knownState);
-                throw e;
+
+        this.votesReceived.set(signal.propose.level, this.votesReceived.get(signal.propose.level) || new Set());
+        this.votesReceived.get(signal.propose.level)!.add(signal.sender);
+
+        const totalPeers = this.proposerSelectorLogic.getAllPeers(signal.propose.level).length;
+        if (this.votesReceived.get(signal.propose.level)!.size >= Math.floor(2 * totalPeers / 3) + 1) {
+            // We have a commit certificate !
+            // Propose a new block - check that we're not re-proposing old blocks, but this is an optimisation only (I think).
+            if (!this.hasProposedBlock.get(signal.propose.level + 1)) {
+                const randomLetter = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+                this.proposeNewBlock(signal.propose.level + 1, randomLetter, signal.propose.data);
+                this.hasProposedBlock.set(signal.propose.level + 1, true);
             }
         }
     }
 
-    propose(value: string) {
-        // logical assert for my simulation
-        if (!this.proposerSelectorLogic.isProposer(this.level, this.peer)) {
-            throw new Error("Not the proposer");
+    proposeNewBlock(level: number, value: string, cheat?: Data<any>) {
+        let buildOnTopOf = this.proposalsVoted.get(level - 1)?.data;
+        // So we might not actually have seen this proposition, despite having received enough votes for it.
+        // In this case, we'd need to make sure we can build on top of it (e.g. having the hash or something).
+        // In my simulation, I can cheat.
+        if (!buildOnTopOf)
+            buildOnTopOf = cheat;
+
+        // Construct the new block
+        const block = new Block(value, buildOnTopOf as Block);
+
+        const message = new ProposeMessage(this.peer, block, level);
+        if ((this.votesReceived.get(level - 1)?.size ?? 0) > (this.timeoutsReceived.get(level - 2)?.size ?? 0)) {
+            console.info("Peer ", this.peer.name, "proposed level", level, "message with value", value)
+            message.withCommit(new FakeCommitCertificate(level - 1, buildOnTopOf as Block, this.votesReceived.get(level - 1)!));
+        } else {
+            console.info("Peer ", this.peer.name, "proposed level", level, "message with value", value, "following a timeout")
+            message.withCommit(new FakeCommitCertificate(level - 1, buildOnTopOf as Block, this.timeoutsReceived.get(level - 2)!));
         }
-
-        // Construct the block
-        const block = new Block(value, this.knownState.get(this.level - 1)!);
-
-        const message = new ProposeMessage(this.peer, block, this.level);
-        message.withCommit(new FakeCommitCertificate(this.level - 1, this.knownState.get(this.level - 1)!, this.ccAggregator));
-
-        console.log("Peer ", this.peer.name, "proposed level", this.level, "message with value", value)
 
         // broadcast
         this.peer.knownPeers.forEach(p => {
             const signal = new Signal(this.peer, p, message);
-            orchestrator.addSignal(signal);
+            this.peer.orchestrator.addSignal(signal);
         });
     }
 
-    handleEnterMessage(signal: Signal, mess: EnterMessage) {
-        // TODO: check message validity
-        //console.log(`Peer ${this.peer.name} (${this.level}) received enter message from ${mess.sender.name} at level ${mess.level}`)
+    onTimeout(signal: TimeoutMessage) {
+        console.debug(`${this.peer.name} received timeout message`);
 
-        // Presume malformed, ignore
-        if (mess.cc === null) {
+        this.timeoutsReceived.set(signal.level, this.timeoutsReceived.get(signal.level) || new Set());
+        this.timeoutsReceived.get(signal.level)!.add(signal.sender);
+
+        if (this.byzantine)
             return;
-        }
 
-        let votes = this.preEnterVotesPerLevel.get(mess.level);
-        if (!votes) {
-            votes = { highestCC: mess.cc, signatures: new Set() };
-            this.preEnterVotesPerLevel.set(mess.level, votes);
-        }
-        votes!.signatures.add(signal.from);
+        if (this.lastVoteLevel - 1 > signal.level)
+            return; // we've already voted at a higher level, so ignore this past timeout info.
+
+        // We are receiving timeouts at signal.level, so the assumption is that the proposer for signal.level + 1 is byzantine.
+
+        // If we have received f+1 timeouts, we know that we'll timeout - people won't equivocate on a timeout,
+        // so we'll never have 2f+1 votes for a block at this level. Enter timeout right away.
+        // (I believe the literature calls this a Bracha echo broadcast).
+        // (this isn't a massive optimisation but it cuts down latency a bit)
+        const totalPeersAtTimeoutLevel = this.proposerSelectorLogic.getAllPeers(signal.level + 1).length;
+        if (this.lastVoteLevel < signal.level + 1 && this.timeoutsReceived.get(signal.level)!.size >= Math.floor(totalPeersAtTimeoutLevel / 3) + 1)
+            this.lastVoteTime = 100; // implementation trick - we'll do it next time.
+
+        // If we're the proposer for the level twice after the timeout, we can propose a new block.
+        if (!this.proposerSelectorLogic.isProposer(signal.level + 2, this.peer))
+            return;
         
-        if (mess.cc !== votes!.highestCC) {
-            // So in this case actually, we'd need to know if this is a CC for a higher level than what we received
-            // (e.g. maybe the proposer of the level did send the message, but only some other node received it)
-            // If that's the case, we would need to ensure that we get the data for the commit, and we can actually build of that.
-            // This is presumably possible, but maybe the node actually disappeared since then, and then what do we do?
-            // We would have to build from another commit certificate as that one is now invalid.
-            // Tricky.
-        }
-        /*
-        if (mess.level < this.level) {
-            // We are more advanced than the timed-out node, send them a message with our latest CC.
-
-            const message = new ProposeMessage(this.proposerSelectorLogic.getProposer(this.level - 2), this.committedState.get(this.level - 2)!, this.level - 2);
-            // We might actually not have data if we were out of date at some point.
-            if (message.data) {
-                console.log(`Peer ${this.peer.name} (${this.level}) re-broadcasting proposer message for level ${this.level - 2} with value ${message.data?.value}`)
-                message.withCommit(this.highestSeenCC);
-                this.peer.knownPeers.forEach(p => {
-                    const signal = new Signal(this.peer, p, message);
-                    orchestrator.addSignal(signal);
-                });
+        const totalPeers = this.proposerSelectorLogic.getAllPeers(signal.level + 2).length;
+        if (this.timeoutsReceived.get(signal.level)!.size >= Math.floor(2 * totalPeers / 3) + 1) {
+            // We have a timeout certificate !
+            // Propose a new block
+            if (!this.hasProposedBlock.get(signal.level + 2)) {
+                // Craft a nil block at level + 1
+                // Implementation note: If we don't actually know the hash of the block we'll 'break' the chain but I accept this for now.
+                const nilBlock = new Block("", this.proposalsVoted.get(signal.level)?.data as Block || null);
+                const randomLetter = String.fromCharCode(65 + Math.floor(Math.random() * 26));
+                this.proposeNewBlock(signal.level + 2, randomLetter, nilBlock);
+                this.hasProposedBlock.set(signal.level + 2, true);
             }
-            return;
-        }*/
-
-        // We have received enough votes to enter the level.
-        // We can commit "nil" blocks, and then create a new commit on top of that with a valid CC.
-        // Anyone receiving it will know that this is the valid chain.
-        if (this.preEnterVotesPerLevel.get(mess.level)!.signatures.size == Math.floor(2 * this.totalPeers / 3) + 1) {
-            if (this.level < mess.level) {
-                this.commitNil(mess.level);
-                console.log("Peer", this.peer.name, "entered level", this.level, "proposer is ", this.proposerSelectorLogic.getProposer(this.level).name)
-                // If we are the proposer, propose the next value
-                if (this.proposerSelectorLogic.isProposer(this.level, this.peer)) {
-                    this.propose("A");
-                }
-            }
-        } else if (this.preEnterVotesPerLevel.get(mess.level)!.signatures.size == Math.floor(this.totalPeers / 3) + 1) {
-            // Bracha echo
-            const oldLevel = this.level;
-            this.enterLevel(mess.level, true);
-            this.signalEnterLevel();
-            this.enterLevel(oldLevel, true);
-            console.log("Peer ", this.peer.name, "re-echoed level", mess.level)
-        }
-    }
-
-    commitNil(level: number) {
-        for (let i = this.level; i < level; i++) {
-            this.knownState.set(i, new Block("", this.knownState.get(i - 1)!));
-        }
-        this.enterLevel(level);
-    }
-
-    processSignal(signal: Signal) {
-        if (this.bizantineOnPurpose) {
-            return;
-        }
-
-        if (signal.message.type === "enter") {
-            const mess = signal.message as EnterMessage;
-            this.handleEnterMessage(signal, mess);
-        } else if (signal.message.type === "propose") {
-            const mess = signal.message as ProposeMessage;
-            this.handleProposeMessage(signal, mess);
-        } else if (signal.message.type === "vote") {
-            const mess = signal.message as VoteMessage;
-            this.handleVoteMessage(signal, mess);
         }
     }
 }
