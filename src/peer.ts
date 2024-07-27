@@ -155,7 +155,9 @@ class Replica {
                 this.committedChain.set(signal.level - 2, commitBlock as Block);
                 console.info("Peer ", this.peer.name, "committed block at level", signal.level - 2, "with value", commitBlock.value);
             } else {
-                console.error("Peer ", this.peer.name, "could not find block to commit at level", signal.level - 2);
+                console.warn("Peer ", this.peer.name, "could not find block to commit at level", signal.level - 2);
+                // This is actually not a safety issue, but lazy implementation - conceptually, we can commit the block hash
+                // without knowing the full block - we know that this is the block that'll be committed, maybe we just missed voting on it or something.
             }
         }
 
