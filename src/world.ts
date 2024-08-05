@@ -1,6 +1,3 @@
-import { FakeCommitCertificate } from "./commitCertif";
-import { Block } from "./data";
-import { ProposeMessage } from "./messages";
 import { Peer } from "./peer";
 import type { Message } from "./messages";
 
@@ -21,7 +18,7 @@ export class Signal {
         this.to = to;
         this.message = message;
     }
-    
+
     setArrivalTime(meanDuration: number) {
         // Max * 20 is effectively a timeout
         this.timeToArrival = Math.min(meanDuration * 20, Math.max(1, samplePoisson(meanDuration)));
@@ -42,11 +39,11 @@ export class DummyProposerSelectorLogic extends ProposerSelectorLogic {
     }
 
     getProposer(level: number) {
-        return new Peer("dummy");
+        return undefined as any;
     }
 
     getAllPeers(level: number) {
-        return [new Peer("dummy")];
+        return [];
     }
 }
 
@@ -70,7 +67,6 @@ export class RoundRobinProposerSelectorLogic extends ProposerSelectorLogic {
         return this.allPeers;
     }
 }
-
 
 export class Orchestrator {
     signals: Signal[] = [];
@@ -105,7 +101,7 @@ export class Orchestrator {
     processSignals() {
         const processSignals = this.signals;
         this.signals = [];
-        console.debug("Processing", processSignals.length, "in-flight signals")
+        console.debug("Processing", processSignals.length, "in-flight signals");
         if (this.signals.length > this.MAX_BANDWIDTH) {
             // randomize the order of processing
             processSignals.sort(() => Math.random() - 0.5);
@@ -131,19 +127,3 @@ export class Orchestrator {
 }
 
 export const orchestrator = new Orchestrator();
-
-export function kickoff(proposerSelector: ProposerSelectorLogic) {
-    // This exists to avoid having to special-case the genesis block in the implementation for simplicity.
-    const genesisProposer = proposerSelector.getProposer(0);
-    const genesisBlock = new Block("A", null);
-    genesisBlock.digest = "A";
-
-    proposerSelector.getAllPeers(0).forEach(peer => {
-        peer.replica.proposalsVoted.set(0, new ProposeMessage(genesisProposer, genesisBlock, 0));
-    });
-    
-    const starter = proposerSelector.getProposer(1);
-    starter.replica.votesReceived.set(0, new Set(proposerSelector.getAllPeers(0)));
-
-    starter.replica.proposeNewBlock(1, "B");
-}

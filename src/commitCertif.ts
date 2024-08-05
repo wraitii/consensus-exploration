@@ -7,8 +7,8 @@ export class FakeCommitCertificate {
     peers: Set<Peer> = new Set();
     data: Data<any>;
     level: number;
-    
-    constructor(level:number, data: Data<any>, peers: Set<Peer>) {
+
+    constructor(level: number, data: Data<any>, peers: Set<Peer>) {
         this.level = level;
         this.data = data;
         this.peers = peers;
@@ -19,7 +19,7 @@ export class FakeCommitCertificate {
     }
 
     checkCertificate(totalPeers: number) {
-        return this.peers.size > Math.floor(2 * totalPeers / 3);
+        return this.peers.size > Math.floor((2 * totalPeers) / 3);
     }
 
     isCertificateOf(data: Data<any>) {
